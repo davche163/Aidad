@@ -1,0 +1,658 @@
+/*******************************************************************************
+ * Copyright (c) 2012, 2019 IBM Corp., and others
+ *
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Eclipse Distribution License v1.0 which accompany this distribution.
+ *
+ * The Eclipse Public License is available at
+ *   http://www.eclipse.org/legal/epl-v10.html
+ * and the Eclipse Distribution License is available at
+ *   http://www.eclipse.org/org/documents/edl-v10.php.
+ *
+ * Contributors:
+ *    Ian Craggs - initial contribution
+ *    Ian Craggs - fix for bug 413429 - connectionLost not called
+ *    Guilherme Maciel Ferreira - add keep alive option
+ *    Ian Craggs - add full capability
+ *******************************************************************************/
+
+#include "MQTTAsync.h"
+#include "MQTTClientPersistence.h"
+#include "pubsub_opts.h"
+
+#include <stdio.h>
+#include <signal.h>
+#include <string.h>
+#include <stdlib.h>
+
+#if defined(WIN32)
+#include <windows.h>
+#define sleep Sleep
+#else
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+#if defined(_WRS_KERNEL)
+#include <OsWrapper.h>
+#endif
+
+volatile int finished = 0;
+int subscribed = 0;
+int disconnected = 0;
+
+pthread_mutex_t mtx;
+int snapCnt = 0;
+
+void mysleep(int ms)
+{
+    #if defined(WIN32)
+        Sleep(ms);
+    #else
+        usleep(ms * 1000);
+    #endif
+}
+
+void cfinish(int sig)
+{
+    signal(SIGINT, NULL);
+    finished = 1;
+}
+
+#include "ipc_rtsp.hpp"
+
+typedef struct _VideoDecoder {
+    ipcCamera* ipc;
+    Mat* image;
+} VideoDecoder;
+
+
+void clean_decode(void * arg)
+{
+    printf("clean_decode finished\n");
+}
+
+void clean_camera(void * arg)
+{
+    pthread_t *tid = static_cast<pthread_t *>(arg);
+    #if 1
+    printf("before clean_camera\n");
+    int err=pthread_cancel(*tid);
+    if(err!=0)
+    {
+        printf("clean_camera failed\n");
+        exit(0);
+    }else{
+        printf("clean_camera ok\n");
+    }
+    pthread_join(*tid, NULL);
+    #endif
+    printf("clean_camera finished\n");
+}
+
+void *onVideoDecode(void *data)
+{
+    pthread_cleanup_push(clean_decode,NULL);
+    VideoDecoder *dec = (VideoDecoder*)data;
+    ipcCamera *ipc = dec->ipc;
+    Mat *mat = dec->image;
+    DecFrame *frame = NULL;
+
+    unsigned long long t1, t2;
+
+    while(1) {
+        frame = ipc->dequeue();
+        if(frame != NULL) {
+            t1 = ipc->microTime();
+            ipc->rgaProcess(frame, V4L2_PIX_FMT_RGB24, mat);
+            t2 = ipc->microTime();
+            //usleep(2000);
+            usleep(1);
+            //printf("rga time: %llums\n", (t2 - t1)/1000);
+            ipc->freeFrame(frame);
+        }
+        usleep(1000);
+    }
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+const string wintitle = "LED-Monitor";
+// led Detection subtype=0, guard subtype=0
+const string ipcUrl="rtsp://192.168.1.108/cam/realmonitor?channel=1&subtype=1";
+//const string ipcUrl="rtsp://192.168.1.108/video1";
+const string ipcUser="admin";
+const string ipcPassword="admin000";
+
+
+Mat image;
+
+int camera_snapshot(Mat image)
+{
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+    fcv::imwrite("/home/openailab/process/pic-guard/" + std::to_string(t0.tv_sec) + "_" + "100" + "_" + "0.99" + "_0.jpg", image);
+    fcv::imwrite("/home/openailab/process/pic-guard/" + std::to_string(t0.tv_sec) + "_" + "100" + "_" + "0.99" + "_1.jpg", image);
+    return 0;
+}
+
+struct pubsub_opts opts =
+{
+    0, 0, 0, 0, "\n", 100,      /* debug/app options */
+    NULL, NULL, 1, 0, 0, /* message options */
+    MQTTVERSION_DEFAULT, NULL, "paho-c-sub", 0, 0, NULL, NULL, "localhost", "1883", NULL, 10, /* MQTT options */
+    NULL, NULL, 0, 0, /* will options */
+    0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, /* TLS options */
+    0, {NULL, NULL}, /* MQTT V5 options */
+};
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "cjson/cJSON.h"
+
+#define LOG_DEBUG 0
+#define LOG_INFO 1
+#include <stdarg.h>
+#include <time.h>
+#include <sys/timeb.h>
+void MyLog(int LOG_level, char* format, ...)
+{
+    static char msg_buf[256];
+    va_list args;
+    struct timeb ts;
+
+    struct tm *timeinfo;
+
+    if (LOG_level == LOG_DEBUG && opts.verbose == 0)
+      return;
+    
+    ftime(&ts);
+    timeinfo = localtime(&ts.time);
+    strftime(msg_buf, 80, "%Y%m%d %H%M%S", timeinfo);
+
+    sprintf(&msg_buf[strlen(msg_buf)], ".%.3hu ", ts.millitm);
+
+    va_start(args, format);
+    vsnprintf(&msg_buf[strlen(msg_buf)], sizeof(msg_buf) - strlen(msg_buf), format, args);
+    va_end(args);
+
+    printf("%s\n", msg_buf);
+    fflush(stdout);
+}
+
+/*********
+{
+    "action":"view",
+    "serialNo":"1002",
+    "displayIndex":"1"
+};
+*********/
+#define ACTION_VIEW "view"
+string SERIALNO = "100002";
+
+int jsonHandler(char *text)
+{
+    cJSON *json = NULL;
+    cJSON *json_action = NULL;
+    cJSON *json_serialNo = NULL;
+    cJSON *json_displayIndex = NULL;
+
+    json = cJSON_Parse(text);
+    if(NULL == json)
+    {
+        MyLog(LOG_INFO, "Error before: [%s]\n", cJSON_GetErrorPtr());
+        return -1;
+    }
+    
+    MyLog(LOG_DEBUG, "%s\n\n", cJSON_Print(json));
+
+    /*********
+    json_displayIndex = cJSON_GetObjectItem(json, "displayIndex");
+    if(json_displayIndex->type == cJSON_Number)
+    {
+        printf("value: %d\n", json_displayIndex->valueint);
+    }
+    *********/
+
+    json_action = cJSON_GetObjectItem(json, "action");
+    if(json_action->type == cJSON_String)
+    {
+        printf("%s\n", json_action->valuestring);
+    }
+    
+    json_serialNo = cJSON_GetObjectItem(json, "serialNo");
+    if(json_serialNo->type == cJSON_String)
+    {
+        printf("%s\n", json_serialNo->valuestring);
+    }
+        
+    json_displayIndex = cJSON_GetObjectItem(json, "displayIndex");
+    if(json_displayIndex->type == cJSON_String)
+    {
+        printf("%s\n", json_displayIndex->valuestring);
+    }
+    
+    if(NULL == json_action || NULL == json_serialNo || NULL == json_displayIndex)
+    {
+        MyLog(LOG_INFO, "unknown json message!");
+        return -1;
+    }
+    
+    if(0 == strncmp(SERIALNO.c_str(),json_serialNo->valuestring,strlen(SERIALNO.c_str()))
+        && 0 == strncmp(ACTION_VIEW,json_action->valuestring,strlen(ACTION_VIEW)))
+    {
+        //write one picture
+        pthread_mutex_lock(&mtx);
+        snapCnt++;
+        pthread_mutex_unlock(&mtx);
+        MyLog(LOG_INFO, "handle message，write one picture!\n\n");
+    }
+
+    cJSON_Delete(json);
+
+    return 0;
+}
+
+int messageArrived(void *context, char *topicName, int topicLen, MQTTAsync_message *message)
+{
+    size_t delimlen = 0;
+
+    MyLog(LOG_INFO, "%d %s\t", message->payloadlen, topicName);
+    
+    if (opts.delimiter)
+        delimlen = strlen(opts.delimiter);
+    if (opts.delimiter == NULL || (message->payloadlen > delimlen &&
+        strncmp(opts.delimiter, &((char*)message->payload)[message->payloadlen - delimlen], delimlen) == 0))
+        MyLog(LOG_INFO, "%.*s", message->payloadlen, (char*)message->payload);
+    else
+        MyLog(LOG_INFO, "%.*s%s", message->payloadlen, (char*)message->payload, opts.delimiter);
+    
+    jsonHandler((char*)message->payload);
+    
+    if (message->struct_version == 1 && opts.verbose)
+        logProperties(&message->properties);
+    fflush(stdout);
+    MQTTAsync_freeMessage(&message);
+    MQTTAsync_free(topicName);
+    return 1;
+}
+
+
+void onDisconnect(void* context, MQTTAsync_successData* response)
+{
+    disconnected = 1;
+    MyLog(LOG_INFO, "called onDisconnect");
+}
+
+
+void onSubscribe5(void* context, MQTTAsync_successData5* response)
+{
+    subscribed = 1;
+    MyLog(LOG_INFO, "called onSubscribe5");
+}
+
+void onSubscribe(void* context, MQTTAsync_successData* response)
+{
+    subscribed = 1;
+    MyLog(LOG_INFO, "called onSubscribe");
+}
+
+
+void onSubscribeFailure5(void* context, MQTTAsync_failureData5* response)
+{
+    MyLog(LOG_INFO, "Subscribe failed, rc %s reason code %s\n",
+                MQTTAsync_strerror(response->code),
+                MQTTReasonCode_toString(response->reasonCode));
+    finished = 1;
+    MyLog(LOG_INFO, "called onSubscribeFailure5");
+}
+
+
+void onSubscribeFailure(void* context, MQTTAsync_failureData* response)
+{
+    MyLog(LOG_INFO, "Subscribe failed, rc %s\n",
+            MQTTAsync_strerror(response->code));
+    finished = 1;
+    MyLog(LOG_INFO, "called onSubscribeFailure");
+}
+
+
+void onConnectFailure5(void* context, MQTTAsync_failureData5* response)
+{
+    MyLog(LOG_INFO, "Connect failed, rc %s reason code %s\n",
+            MQTTAsync_strerror(response->code),
+            MQTTReasonCode_toString(response->reasonCode));
+    finished = 1;
+    MyLog(LOG_INFO, "called onConnectFailure5");
+}
+
+
+void onConnectFailure(void* context, MQTTAsync_failureData* response)
+{
+    MyLog(LOG_INFO, "Connect failed, rc %s\n", response ? MQTTAsync_strerror(response->code) : "none");
+    finished = 1;
+    MyLog(LOG_INFO, "called onConnectFailure");
+}
+
+
+void onConnect5(void* context, MQTTAsync_successData5* response)
+{
+    MQTTAsync client = (MQTTAsync)context;
+    MQTTAsync_callOptions copts = MQTTAsync_callOptions_initializer;
+    int rc;
+
+    if (opts.verbose)
+        printf("Subscribing to topic %s with client %s at QoS %d\n", opts.topic, opts.clientid, opts.qos);
+
+    copts.onSuccess5 = onSubscribe5;
+    copts.onFailure5 = onSubscribeFailure5;
+    copts.context = client;
+    if ((rc = MQTTAsync_subscribe(client, opts.topic, opts.qos, &copts)) != MQTTASYNC_SUCCESS)
+    {
+        MyLog(LOG_INFO,"Failed to start subscribe, return code %s\n", MQTTAsync_strerror(rc));
+        finished = 1;
+    }
+}
+
+
+void onConnect(void* context, MQTTAsync_successData* response)
+{
+    MQTTAsync client = (MQTTAsync)context;
+    MQTTAsync_responseOptions ropts = MQTTAsync_responseOptions_initializer;
+    int rc;
+
+    if (opts.verbose)
+        printf("Subscribing to topic %s with client %s at QoS %d\n", opts.topic, opts.clientid, opts.qos);
+
+    ropts.onSuccess = onSubscribe;
+    ropts.onFailure = onSubscribeFailure;
+    ropts.context = client;
+    if ((rc = MQTTAsync_subscribe(client, opts.topic, opts.qos, &ropts)) != MQTTASYNC_SUCCESS)
+    {
+        MyLog(LOG_INFO,"Failed to start subscribe, return code %s\n", MQTTAsync_strerror(rc));
+        finished = 1;
+    }
+    MyLog(LOG_INFO,"onConnect success!\n");
+}
+
+MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
+
+
+void trace_callback(enum MQTTASYNC_TRACE_LEVELS level, char* message)
+{
+    fprintf(stderr, "Trace : %d, %s\n", level, message);
+}
+
+/*******************************************************************************
+函 数 名 : onConnected
+功能描述 : MQTTAsync_setConnected()函数重连成功调用的函数，在这里做重连之后的订阅操作
+输入参数 : VOID *context, CHAR *cause，参数是固定的
+输出参数 : None
+返 回 值 : None
+*******************************************************************************/
+void onConnected(void* context, char* cause)
+{
+    printf("set on connected\n");
+    MQTTAsync_responseOptions ropts = MQTTAsync_responseOptions_initializer;
+    ropts.onSuccess = onSubscribe;
+    ropts.onFailure = onSubscribeFailure;
+    ropts.context = (MQTTAsync)context;
+ 
+    int rc;
+    MyLog(LOG_INFO, "Successful connection, then...");
+    if ((rc = MQTTAsync_subscribe((MQTTAsync)context, opts.topic, opts.qos, &ropts)) != MQTTASYNC_SUCCESS)
+    {
+        MyLog(LOG_INFO,"Failed to start subscribe in onConnected, return code %s\n", MQTTAsync_strerror(rc));
+        finished = 1;
+    }
+    MyLog(LOG_INFO,"onConnected success!\n");
+}
+
+/*******************************************************************************
+拔网线1分钟后插回，日志如下:（不设置-k keepalive默认为10s）
+20200404 211554.475 MQTT link broke !
+Connect failed, rc Failure
+20200404 211554.479 called onConnectFailure
+20200404 211555.577 MQTT link broke !
+Subscribing to topic device-topic with client 100009 at QoS 0
+set on connected
+Successful connection, then 20200404 211555.778 called onSubscribe
+*******************************************************************************/
+
+int main(int argc, char** argv)
+{
+    MQTTAsync client;
+    MQTTAsync_disconnectOptions disc_opts = MQTTAsync_disconnectOptions_initializer;
+    MQTTAsync_createOptions create_opts = MQTTAsync_createOptions_initializer;
+    MQTTAsync_willOptions will_opts = MQTTAsync_willOptions_initializer;
+    MQTTAsync_SSLOptions ssl_opts = MQTTAsync_SSLOptions_initializer;
+    int rc = 0;
+    char* url = NULL;
+    const char* version = NULL;
+    const char* program_name = "paho_c_sub";
+    MQTTAsync_nameValue* infos = MQTTAsync_getVersionInfo();
+#if !defined(WIN32)
+    struct sigaction sa;
+#endif
+
+    if (argc < 2)
+        usage(&opts, (pubsub_opts_nameValue*)infos, program_name);
+
+    if (getopts(argc, argv, &opts) != 0)
+        usage(&opts, (pubsub_opts_nameValue*)infos, program_name);
+
+    opts.verbose = 1;
+
+    if (opts.connection)
+        url = opts.connection;
+    else
+    {
+        url = static_cast<char*>(malloc(100));
+        sprintf(url, "%s:%s", opts.host, opts.port);
+    }
+    if (opts.verbose)
+        printf("URL is %s\n", url);
+    
+    // fix clientid using SERIALNO
+    #if 0
+    // can't change clientid in code, must set in parameter(-i) on runtime !!!!
+    // opts.clientid = SERIALNO;
+    #endif
+    // SERIALNO use MQTT clientid 
+    SERIALNO = opts.clientid;
+    
+    // process camera_init in main
+    pthread_mutex_init(&mtx, NULL);
+    int ret = 0;
+    __u32 width = 800, height = 480;
+    RgaRotate rotate = RGA_ROTATE_NONE;
+    __u32 cropx = 0, cropy = 0, cropw = 0, croph = 0;
+    int vflip = 0, hflip = 0;
+    int display = 0;
+    DecodeType type=DECODE_TYPE_H264;
+    //DecodeType type=DECODE_TYPE_H265;
+    int writeLimit = 0;
+
+    VideoDecoder* decoder=(VideoDecoder*)malloc(sizeof(VideoDecoder));
+    if(display) fcv::namedWindow(wintitle);
+    ipcCamera *ipc = new ipcCamera(width, height, rotate, vflip, hflip, cropx, cropy, cropw, croph);
+    decoder->ipc = ipc;
+    decoder->image = &image;
+    RtspClient rtspClient(ipcUrl, ipcUser, ipcPassword);
+    ret = ipc->init(type);
+    if(ret < 0) {
+        printf("ipc init failed\n");
+        return NULL;
+    }
+    image.create(cv::Size(width, height), CV_8UC3);
+    pthread_t pid;
+    ret = pthread_create(&pid, NULL, onVideoDecode, decoder);
+    if(ret < 0) {
+        printf("pthread_create failed\n");
+        return NULL;
+    }
+
+    rtspClient.setDataCallback(std::bind(&ipcCamera::onStreamReceive, ipc, std::placeholders::_1, std::placeholders::_2));
+    rtspClient.enable();
+    
+    if (opts.tracelevel > 0)
+    {
+        MQTTAsync_setTraceCallback(trace_callback);
+        MQTTAsync_setTraceLevel(static_cast<MQTTASYNC_TRACE_LEVELS>(opts.tracelevel));
+    }
+
+    if (opts.MQTTVersion >= MQTTVERSION_5)
+        create_opts.MQTTVersion = MQTTVERSION_5;
+
+    rc = MQTTAsync_createWithOptions(&client, url, opts.clientid, MQTTCLIENT_PERSISTENCE_NONE,
+            NULL, &create_opts);
+
+    if (rc != MQTTASYNC_SUCCESS)
+    {
+        if (!opts.quiet)
+            fprintf(stderr, "Failed to create client, return code: %s\n", MQTTAsync_strerror(rc));
+        exit(EXIT_FAILURE);
+    }
+
+    rc = MQTTAsync_setCallbacks(client, client, NULL, messageArrived, NULL);
+    if (rc != MQTTASYNC_SUCCESS)
+    {
+        if (!opts.quiet)
+            fprintf(stderr, "Failed to set callbacks, return code: %s\n", MQTTAsync_strerror(rc));
+        exit(EXIT_FAILURE);
+    }
+
+#if defined(WIN32)
+    signal(SIGINT, cfinish);
+    signal(SIGTERM, cfinish);
+#else
+    memset(&sa, 0, sizeof(struct sigaction));
+    sa.sa_handler = cfinish;
+    sa.sa_flags = 0;
+
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+#endif
+
+    if (opts.MQTTVersion == MQTTVERSION_5)
+    {
+        MQTTAsync_connectOptions conn_opts5 = MQTTAsync_connectOptions_initializer5;
+        conn_opts = conn_opts5;
+        conn_opts.onSuccess5 = onConnect5;
+        conn_opts.onFailure5 = onConnectFailure5;
+        conn_opts.cleanstart = 1;
+    }
+    else
+    {
+        conn_opts.onSuccess = onConnect;
+        conn_opts.onFailure = onConnectFailure;
+        conn_opts.cleansession = 0;
+    }
+    conn_opts.keepAliveInterval = opts.keepalive;
+    conn_opts.username = opts.username;
+    conn_opts.password = opts.password;
+    conn_opts.MQTTVersion = opts.MQTTVersion;
+    conn_opts.context = client;
+    conn_opts.automaticReconnect = 1;
+
+    if (opts.will_topic)     /* will options */
+    {
+        will_opts.message = opts.will_payload;
+        will_opts.topicName = opts.will_topic;
+        will_opts.qos = opts.will_qos;
+        will_opts.retained = opts.will_retain;
+        conn_opts.will = &will_opts;
+    }
+
+    if (opts.connection && (strncmp(opts.connection, "ssl://", 6) == 0 ||
+            strncmp(opts.connection, "wss://", 6) == 0))
+    {
+        ssl_opts.verify = (opts.insecure) ? 0 : 1;
+        ssl_opts.CApath = opts.capath;
+        ssl_opts.keyStore = opts.cert;
+        ssl_opts.trustStore = opts.cafile;
+        ssl_opts.privateKey = opts.key;
+        ssl_opts.privateKeyPassword = opts.keypass;
+        ssl_opts.enabledCipherSuites = opts.ciphers;
+        conn_opts.ssl = &ssl_opts;
+    }
+
+    #if 0
+    if ((rc = MQTTAsync_connect(client, &conn_opts)) != MQTTASYNC_SUCCESS)
+    {
+        if (!opts.quiet)
+            fprintf(stderr, "Failed to start connect, return code %s\n", MQTTAsync_strerror(rc));
+        exit(EXIT_FAILURE);
+    }
+    #endif
+    
+    while(1)
+    {
+		rc = MQTTAsync_connect(client, &conn_opts);
+        if (rc == MQTTASYNC_SUCCESS)
+        {
+            MyLog(LOG_INFO, "Successfully start the request of connect.");
+            break;
+        }
+        mysleep(1000); // 1s
+        MyLog(LOG_INFO, "Failed to start connect, return code %s", MQTTAsync_strerror(rc));
+    }
+    
+    while(1)
+    {
+		rc = MQTTAsync_setConnected(client, static_cast<void *>(client), onConnected);
+        if (rc == MQTTASYNC_SUCCESS)
+        {
+            MyLog(LOG_INFO, "Successfully setConnected.");
+            break;
+        }
+        mysleep(1000); // 1s
+        MyLog(LOG_INFO, "Failed to start connect, return code %s", MQTTAsync_strerror(rc));
+    }
+
+    // reconnection and resubscribe, when link broke.
+    while (1)
+    {
+        mysleep(1000);
+        if (finished)
+        {
+            MQTTAsync_disconnect(client, &disc_opts);
+            MyLog(LOG_INFO,"MQTT link broke !\n");
+            finished = 0;
+            subscribed = 0;
+            MQTTAsync_connect(client, &conn_opts);
+            mysleep(100);
+            if(subscribed) MyLog(LOG_INFO,"reconnection finish !\n");
+        }
+        if(snapCnt>0)
+        {
+            pthread_mutex_lock(&mtx);
+            snapCnt--;
+            pthread_mutex_unlock(&mtx);
+            camera_snapshot(image);
+        }
+        fcv::waitKey(1);  // unknown function, it make no difference.
+        //mysleep(1000);
+    }
+    MyLog(LOG_INFO,"main while exit!\n");
+
+exit:
+    MQTTAsync_destroy(&client);
+
+    int err=pthread_cancel(pid);
+    if(err!=0)
+    {
+        MyLog(LOG_INFO,"clean_camera failed\n");
+        exit(0);
+    }else{
+        MyLog(LOG_INFO,"clean_camera called!\n");
+    }
+    pthread_join(pid, NULL);
+    MyLog(LOG_INFO,"all pthread exit!\n");
+    image.release();
+    delete ipc;
+    free(decoder);
+    MyLog(LOG_INFO,"main thread exit!\n");
+    return EXIT_SUCCESS;
+}
