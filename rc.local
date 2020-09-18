@@ -1,0 +1,41 @@
+#!/bin/bash
+# THIS FILE IS ADDED FOR COMPATIBILITY PURPOSES
+#
+# It is highly advisable to create own systemd services or udev rules
+# to run scripts during boot instead of using this file.
+#
+# In contrast to previous versions due to parallel execution during boot
+# this script will NOT be run after all other services.
+#
+# Please note that you must run 'chmod +x /etc/rc.d/rc.local' to ensure
+# that this script will be executed during boot.
+
+touch /var/lock/subsys/local
+
+chmod 0666 /dev/rkvdec
+chmod 0666 /dev/vpu_service
+chmod 0666 /dev/mali0
+chmod 0666 /dev/rga
+chmod 0666 /dev/dri/card0
+
+chmod 0666 /dev/ttyXRUSB0
+chmod 0666 /dev/ttyXRUSB1
+chmod 0666 /dev/ttyXRUSB2
+chmod 0666 /dev/ttyXRUSB3
+
+#insmod /system/lib/modules/bcmdhd.ko
+/usr/bin/resize.sh
+/usr/bin/rt5651.sh
+/etc/rc.d/gen_product_id
+/usr/bin/system_led &i
+/usr/bin/ws_client 192.168.89.230 3011 &
+
+source /home/openailab/.bashrc
+sleep 35
+/bin/bash /home/openailab/process/pic-upload/restart.sh 61000191200546
+/bin/bash /home/openailab/process/pic-guard/restart.sh 61000191200546
+/bin/bash /home/openailab/process/LED-600/restart.sh
+sleep 35
+/bin/bash /home/openailab/process/guard/restart.sh 61000191200546
+touch /home/openailab/process/touch.txt
+
